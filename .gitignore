@@ -1,0 +1,34 @@
+# Git ignore for TrustOCT project
+# Data & outputs (too large for GitHub)
+data/
+outputs/
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment
+.env
+venv/
+env/
