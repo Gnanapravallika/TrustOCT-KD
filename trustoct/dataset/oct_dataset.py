@@ -115,6 +115,28 @@ def get_transforms(image_size=(224, 224), is_train=True):
         ])
 
 
+def print_class_distributions(data_dir, classes=['CNV', 'DME', 'DRUSEN', 'NORMAL']):
+    """
+    Prints class distribution breakdown formatted like the reference notebook.
+    """
+    print("\n--- Split Class Distributions ---")
+    print(f"{'Class':<12} | {'Train':<8} | {'Val':<8} | {'Test':<8}")
+    print("-" * 45)
+    
+    counts = {cls: {'train': 0, 'val': 0, 'test': 0} for cls in classes}
+    for split in ['train', 'val', 'test']:
+        split_dir = os.path.join(data_dir, split)
+        if os.path.exists(split_dir):
+            for cls in classes:
+                cls_dir = os.path.join(split_dir, cls)
+                if os.path.exists(cls_dir):
+                    counts[cls][split] = len([f for f in os.listdir(cls_dir) if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
+                    
+    for cls in classes:
+        print(f"{cls:<12} | {counts[cls]['train']:<8} | {counts[cls]['val']:<8} | {counts[cls]['test']:<8}")
+    print("-" * 45 + "\n")
+
+
 def get_dataloaders(data_dir, batch_size=32, num_workers=2, image_size=(224, 224), 
                     use_clahe=True, max_samples_per_class=None):
     """
@@ -128,13 +150,11 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=2, image_size=(224, 224
     train_dataset = OCTDataset(data_dir, split='train', classes=classes, use_clahe=use_clahe,
                               transform=train_transform, max_samples_per_class=max_samples_per_class)
     
-    # Handle val directory or split from train
     val_dir = os.path.join(data_dir, 'val')
     if os.path.exists(val_dir):
         val_dataset = OCTDataset(data_dir, split='val', classes=classes, use_clahe=use_clahe,
                                 transform=val_transform, max_samples_per_class=max_samples_per_class)
     else:
-        # Fallback val set creation from train dataset if val directory absent
         val_dataset = OCTDataset(data_dir, split='train', classes=classes, use_clahe=use_clahe,
                                 transform=val_transform, max_samples_per_class=100)
         
