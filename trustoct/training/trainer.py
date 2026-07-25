@@ -1,13 +1,16 @@
 import os
+import sys
 import json
 import time
 import random
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import f1_score
-from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 def set_seed(seed=42):
     """Fix random seeds for 100% reproducible scientific experiments."""
@@ -20,9 +23,23 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+def get_amp_scaler(enabled=True):
+    """Helper for PyTorch version-compatible AMP GradScaler."""
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        return torch.amp.GradScaler('cuda', enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def get_amp_autocast(enabled=True):
+    """Helper for PyTorch version-compatible AMP autocast."""
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        return torch.amp.autocast('cuda', enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
 class Trainer:
     """
-    Research-grade Trainer formatted with clean console logs and Macro F1 tracking.
+    Research-grade Trainer formatted with live console logs, periodic batch updates, and Macro F1 tracking.
     """
     def __init__(self, model, train_loader, val_loader, device,
                  lr=1e-4, weight_decay=1e-4, num_epochs=20, 
@@ -43,22 +60,23 @@ class Trainer:
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs, eta_min=1e-6)
         
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = get_amp_scaler(enabled=self.use_amp)
         self.history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_f1': [], 'lr': []}
 
-    def train_epoch(self):
+    def train_epoch(self, epoch):
         self.model.train()
         running_loss = 0.0
         correct = 0
         total = 0
+        num_batches = len(self.train_loader)
         
-        for images, labels in self.train_loader:
+        for batch_idx, (images, labels) in enumerate(self.train_loader, 1):
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             
             self.optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with get_amp_autocast(enabled=self.use_amp):
                 outputs = self.model(images)
                 loss = self.criterion(outputs, labels)
                 
@@ -70,6 +88,11 @@ class Trainer:
             _, preds = torch.max(outputs, 1)
             correct += torch.sum(preds == labels.data).item()
             total += labels.size(0)
+            
+            # Print live batch updates every 300 batches in Colab
+            if batch_idx % 300 == 0 or batch_idx == num_batches:
+                print(f"  Batch [{batch_idx:4d}/{num_batches:4d}] | Loss: {running_loss/total:.4f} | Acc: {correct/total*100:.2f}%", flush=True)
+                sys.stdout.flush()
             
         epoch_loss = running_loss / total
         epoch_acc = correct / total
@@ -88,7 +111,7 @@ class Trainer:
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with get_amp_autocast(enabled=self.use_amp):
                 outputs = self.model(images)
                 loss = self.criterion(outputs, labels)
                 
@@ -109,11 +132,15 @@ class Trainer:
         best_val_f1 = 0.0
         best_checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.experiment_name}_best.pth")
         
-        print(f"\nTraining {self.experiment_name} for {self.num_epochs} epochs on {self.device}...")
+        print(f"\nTraining {self.experiment_name} for {self.num_epochs} epochs on {self.device}...", flush=True)
+        sys.stdout.flush()
         
         start_time = time.time()
         for epoch in range(1, self.num_epochs + 1):
-            train_loss, train_acc = self.train_epoch()
+            print(f"\n--- Epoch [{epoch}/{self.num_epochs}] ---", flush=True)
+            sys.stdout.flush()
+            
+            train_loss, train_acc = self.train_epoch(epoch)
             val_loss, val_acc, val_f1 = self.validate()
             
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -126,8 +153,9 @@ class Trainer:
             self.history['val_f1'].append(val_f1)
             self.history['lr'].append(current_lr)
             
-            # Print epoch output formatted exactly like reference screenshot
-            print(f"Epoch {epoch}/{self.num_epochs} | Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}")
+            # Print epoch summary with immediate unbuffered flush
+            print(f"Epoch {epoch:02d}/{self.num_epochs:02d} | Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}", flush=True)
+            sys.stdout.flush()
             
             # Save Best Model Checkpoint based on Val Macro F1
             if val_f1 > best_val_f1:
@@ -140,10 +168,12 @@ class Trainer:
                     'val_f1': val_f1,
                     'history': self.history
                 }, best_checkpoint_path)
-                print(f"✅ Best model updated! Val Macro F1: {val_f1:.4f}")
+                print(f"✅ Best model updated! Val Macro F1: {val_f1:.4f}", flush=True)
+                sys.stdout.flush()
 
         total_time = time.time() - start_time
-        print(f"\nTraining completed in {total_time/60:.2f} minutes. Best Val Macro F1: {best_val_f1:.4f}")
+        print(f"\nTraining completed in {total_time/60:.2f} minutes. Best Val Macro F1: {best_val_f1:.4f}", flush=True)
+        sys.stdout.flush()
         
         # Save training history JSON
         history_path = os.path.join(self.checkpoint_dir, f"{self.experiment_name}_history.json")

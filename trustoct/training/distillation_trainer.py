@@ -1,40 +1,37 @@
 import os
+import sys
 import json
 import time
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+def get_amp_scaler(enabled=True):
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        return torch.amp.GradScaler('cuda', enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def get_amp_autocast(enabled=True):
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        return torch.amp.autocast('cuda', enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
 
 class DistillationTrainer:
     """
-    Calibration-Aware Knowledge Distillation Trainer.
-    
-    Combines three loss components:
-      1. Hard Label Loss (CE):   Student predictions vs ground truth
-      2. Soft Label Loss (KD):   Student soft outputs vs Teacher soft outputs (KL Divergence)
-      3. Attention Transfer Loss: Student spatial features vs Teacher spatial attention maps
-    
-    The KD temperature acts as an implicit calibration mechanism — soft targets 
-    from a well-calibrated teacher transfer inter-class similarity structure 
-    to the student, producing better-calibrated confidence estimates.
+    Calibration-Aware Knowledge Distillation Trainer with live unbuffered logging.
     """
     def __init__(self, teacher_model, student_model, train_loader, val_loader, device,
                  lr=1e-3, weight_decay=1e-4, num_epochs=20,
                  temperature=4.0, alpha=0.3, beta=0.5, gamma=0.2,
                  checkpoint_dir="./outputs/checkpoints",
                  experiment_name="KD_TrustOCT", use_amp=True):
-        """
-        Args:
-            teacher_model: Pre-trained teacher (ResNet50+MSF+CBAM), frozen during distillation
-            student_model: Lightweight student (MobileNetV3-Small), trained during distillation
-            temperature: Softmax temperature for KD (higher = softer distributions)
-            alpha: Weight for hard label CE loss
-            beta:  Weight for soft label KD loss
-            gamma: Weight for attention transfer loss
-        """
         self.teacher = teacher_model.to(device)
         self.student = student_model.to(device)
         self.train_loader = train_loader
@@ -51,7 +48,6 @@ class DistillationTrainer:
         
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         
-        # Freeze teacher completely
         self.teacher.eval()
         for param in self.teacher.parameters():
             param.requires_grad = False
@@ -61,50 +57,40 @@ class DistillationTrainer:
         
         self.optimizer = optim.AdamW(self.student.parameters(), lr=lr, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs, eta_min=1e-6)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = get_amp_scaler(enabled=self.use_amp)
         
         self.history = {
             'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [],
             'ce_loss': [], 'kd_loss': [], 'attn_loss': [], 'lr': []
         }
         
-        # Register hooks to capture teacher's intermediate features
         self.teacher_features = {}
         self._register_teacher_hooks()
 
     def _register_teacher_hooks(self):
-        """Register forward hooks to capture teacher's CBAM attention-weighted features."""
         def hook_fn(name):
             def hook(module, input, output):
                 self.teacher_features[name] = output.detach()
             return hook
         
-        # Capture the fused feature map after CBAM (the teacher's key attention output)
         if hasattr(self.teacher, 'cbam_fused'):
             self.teacher.cbam_fused.register_forward_hook(hook_fn('fused_attn'))
         elif hasattr(self.teacher, 'layer4'):
             self.teacher.layer4.register_forward_hook(hook_fn('fused_attn'))
 
     def _get_teacher_outputs(self, images):
-        """Get teacher's logits and attention features (no gradient)."""
         with torch.no_grad():
             teacher_logits = self.teacher(images)
         teacher_feat = self.teacher_features.get('fused_attn', None)
         return teacher_logits, teacher_feat
 
     def _attention_transfer_loss(self, student_feat, teacher_feat):
-        """
-        Compute attention transfer loss between student and teacher spatial features.
-        Uses L2 loss on normalized spatial attention maps.
-        """
         if student_feat is None or teacher_feat is None:
             return torch.tensor(0.0, device=self.device)
         
-        # Generate spatial attention maps (channel-wise mean)
-        student_attn = torch.mean(student_feat, dim=1)  # [B, H, W]
-        teacher_attn = torch.mean(teacher_feat, dim=1)  # [B, H', W']
+        student_attn = torch.mean(student_feat, dim=1)
+        teacher_attn = torch.mean(teacher_feat, dim=1)
         
-        # Resize teacher attention to match student spatial dimensions
         if student_attn.shape != teacher_attn.shape:
             teacher_attn = F.interpolate(
                 teacher_attn.unsqueeze(1), 
@@ -113,25 +99,17 @@ class DistillationTrainer:
                 align_corners=False
             ).squeeze(1)
         
-        # L2 normalize attention maps before comparison
         student_attn = F.normalize(student_attn.view(student_attn.size(0), -1), p=2, dim=1)
         teacher_attn = F.normalize(teacher_attn.view(teacher_attn.size(0), -1), p=2, dim=1)
         
         return F.mse_loss(student_attn, teacher_attn)
 
     def _distillation_loss(self, student_logits, teacher_logits):
-        """
-        Compute KL Divergence loss on temperature-scaled softmax outputs.
-        This is the core "dark knowledge" transfer from Hinton et al.
-        """
         student_soft = F.log_softmax(student_logits / self.temperature, dim=1)
         teacher_soft = F.softmax(teacher_logits / self.temperature, dim=1)
-        
-        # Scale by T^2 as per Hinton et al. to maintain gradient magnitude
-        kd_loss = self.criterion_kd(student_soft, teacher_soft) * (self.temperature ** 2)
-        return kd_loss
+        return self.criterion_kd(student_soft, teacher_soft) * (self.temperature ** 2)
 
-    def train_epoch(self):
+    def train_epoch(self, epoch):
         self.student.train()
         self.teacher.eval()
         
@@ -141,31 +119,20 @@ class DistillationTrainer:
         running_attn = 0.0
         correct = 0
         total = 0
+        num_batches = len(self.train_loader)
         
-        pbar = tqdm(self.train_loader, desc="[KD Train]", leave=False)
-        for images, labels in pbar:
+        for batch_idx, (images, labels) in enumerate(self.train_loader, 1):
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             
             self.optimizer.zero_grad()
-            
-            # Get teacher outputs (frozen, no grad)
             teacher_logits, teacher_feat = self._get_teacher_outputs(images)
             
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                # Get student outputs with features for attention transfer
+            with get_amp_autocast(enabled=self.use_amp):
                 student_logits, student_feat = self.student(images, return_features=True)
-                
-                # Loss 1: Hard label cross-entropy
                 ce_loss = self.criterion_ce(student_logits, labels)
-                
-                # Loss 2: Soft label KD (dark knowledge transfer)
                 kd_loss = self._distillation_loss(student_logits, teacher_logits)
-                
-                # Loss 3: Attention transfer
                 attn_loss = self._attention_transfer_loss(student_feat, teacher_feat)
-                
-                # Combined calibration-aware loss
                 total_loss = self.alpha * ce_loss + self.beta * kd_loss + self.gamma * attn_loss
             
             self.scaler.scale(total_loss).backward()
@@ -181,12 +148,10 @@ class DistillationTrainer:
             correct += torch.sum(preds == labels.data).item()
             total += labels.size(0)
             
-            pbar.set_postfix({
-                'loss': f"{total_loss.item():.4f}",
-                'CE': f"{ce_loss.item():.3f}",
-                'KD': f"{kd_loss.item():.3f}",
-                'acc': f"{correct/total:.4f}"
-            })
+            # Print live batch updates every 300 batches in Colab
+            if batch_idx % 300 == 0 or batch_idx == num_batches:
+                print(f"  [KD Batch {batch_idx:4d}/{num_batches:4d}] | Loss: {running_loss/total:.4f} | CE: {running_ce/total:.3f} | KD: {running_kd/total:.3f} | Acc: {correct/total*100:.2f}%", flush=True)
+                sys.stdout.flush()
         
         n = total
         return (running_loss/n, running_ce/n, running_kd/n, running_attn/n, correct/n)
@@ -202,7 +167,7 @@ class DistillationTrainer:
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with get_amp_autocast(enabled=self.use_amp):
                 outputs = self.student(images)
                 loss = self.criterion_ce(outputs, labels)
             
@@ -217,15 +182,19 @@ class DistillationTrainer:
         best_val_acc = 0.0
         best_path = os.path.join(self.checkpoint_dir, f"{self.experiment_name}_student_best.pth")
         
-        print(f"\n{'='*65}")
-        print(f" Knowledge Distillation: {self.experiment_name}")
-        print(f" Temperature: {self.temperature} | α={self.alpha} β={self.beta} γ={self.gamma}")
-        print(f" Epochs: {self.num_epochs} | Device: {self.device} | AMP: {self.use_amp}")
-        print(f"{'='*65}\n")
+        print(f"\n{'='*65}", flush=True)
+        print(f" Knowledge Distillation: {self.experiment_name}", flush=True)
+        print(f" Temperature: {self.temperature} | α={self.alpha} β={self.beta} γ={self.gamma}", flush=True)
+        print(f" Epochs: {self.num_epochs} | Device: {self.device} | AMP: {self.use_amp}", flush=True)
+        print(f"{'='*65}\n", flush=True)
+        sys.stdout.flush()
         
         start_time = time.time()
         for epoch in range(1, self.num_epochs + 1):
-            train_loss, ce_loss, kd_loss, attn_loss, train_acc = self.train_epoch()
+            print(f"\n--- [KD Epoch {epoch}/{self.num_epochs}] ---", flush=True)
+            sys.stdout.flush()
+            
+            train_loss, ce_loss, kd_loss, attn_loss, train_acc = self.train_epoch(epoch)
             val_loss, val_acc = self.validate()
             
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -242,14 +211,15 @@ class DistillationTrainer:
             
             print(f"Epoch [{epoch:02d}/{self.num_epochs:02d}] "
                   f"Loss: {train_loss:.4f} (CE:{ce_loss:.3f} KD:{kd_loss:.3f} Attn:{attn_loss:.3f}) | "
-                  f"Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}% | LR: {current_lr:.2e}")
+                  f"Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}% | LR: {current_lr:.2e}", flush=True)
+            sys.stdout.flush()
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': self.student.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'optimizer_state_dict': self.student.state_dict(),
                     'val_acc': val_acc,
                     'history': self.history,
                     'config': {
@@ -257,10 +227,12 @@ class DistillationTrainer:
                         'alpha': self.alpha, 'beta': self.beta, 'gamma': self.gamma
                     }
                 }, best_path)
-                print(f"  -> Best student saved: {best_path} (Val Acc: {val_acc*100:.2f}%)")
+                print(f"  -> Best student saved: {best_path} (Val Acc: {val_acc*100:.2f}%)", flush=True)
+                sys.stdout.flush()
 
         total_time = time.time() - start_time
-        print(f"\nDistillation completed in {total_time/60:.2f} min. Best Val Acc: {best_val_acc*100:.2f}%")
+        print(f"\nDistillation completed in {total_time/60:.2f} min. Best Val Acc: {best_val_acc*100:.2f}%", flush=True)
+        sys.stdout.flush()
         
         history_path = os.path.join(self.checkpoint_dir, f"{self.experiment_name}_history.json")
         with open(history_path, 'w') as f:

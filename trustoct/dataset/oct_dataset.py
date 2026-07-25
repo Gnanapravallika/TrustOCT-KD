@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 
 class CLAHEPreprocessing:
@@ -19,14 +19,12 @@ class CLAHEPreprocessing:
     def __call__(self, img_pil):
         img_np = np.array(img_pil)
         if len(img_np.shape) == 3 and img_np.shape[2] == 3:
-            # Convert to LAB color space and apply CLAHE to L-channel
             lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
             l, a, b = cv2.split(lab)
             l_clahe = self.clahe.apply(l)
             lab_clahe = cv2.merge((l_clahe, a, b))
             img_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2RGB)
         else:
-            # Grayscale single channel
             img_clahe = self.clahe.apply(img_np)
             img_clahe = cv2.cvtColor(img_clahe, cv2.COLOR_GRAY2RGB)
         return Image.fromarray(img_clahe)
@@ -49,10 +47,9 @@ class OCTDataset(Dataset):
         self.image_paths = []
         self.labels = []
         
-        # Check split path
         split_dir = os.path.join(self.root_dir, split)
         if not os.path.exists(split_dir):
-            split_dir = self.root_dir  # fallback if no train/val subdirectories
+            split_dir = self.root_dir
             
         for cls_name in self.classes:
             cls_dir = os.path.join(split_dir, cls_name)
@@ -79,7 +76,6 @@ class OCTDataset(Dataset):
         try:
             image = Image.open(img_path).convert('RGB')
         except Exception:
-            # Fallback for corrupted file
             image = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
 
         if self.use_clahe and self.clahe is not None:
@@ -92,9 +88,6 @@ class OCTDataset(Dataset):
 
 
 def get_transforms(image_size=(224, 224), is_train=True):
-    """
-    Standard train and validation/test transformation pipelines.
-    """
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     
@@ -116,9 +109,6 @@ def get_transforms(image_size=(224, 224), is_train=True):
 
 
 def print_class_distributions(data_dir, classes=['CNV', 'DME', 'DRUSEN', 'NORMAL']):
-    """
-    Prints class distribution breakdown formatted like the reference notebook.
-    """
     print("\n--- Split Class Distributions ---")
     print(f"{'Class':<12} | {'Train':<8} | {'Val':<8} | {'Test':<8}")
     print("-" * 45)
@@ -138,28 +128,52 @@ def print_class_distributions(data_dir, classes=['CNV', 'DME', 'DRUSEN', 'NORMAL
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=2, image_size=(224, 224), 
-                    use_clahe=True, max_samples_per_class=None):
+                    use_clahe=True, max_samples_per_class=None, val_ratio=0.10, seed=42):
     """
     Creates train, val, and test DataLoaders for OCT classification.
+    
+    Note on Kermany dataset:
+      The raw Kermany 2018 folder has only 32 images in `val/` (8 per class),
+      which causes artificially 100% validation accuracy.
+      To fix this, we split 10% of `train/` (~8,348 images) into a realistic
+      Validation set if `val/` has fewer than 500 images.
     """
     classes = ['CNV', 'DME', 'DRUSEN', 'NORMAL']
     
     train_transform = get_transforms(image_size, is_train=True)
     val_transform = get_transforms(image_size, is_train=False)
     
-    train_dataset = OCTDataset(data_dir, split='train', classes=classes, use_clahe=use_clahe,
-                              transform=train_transform, max_samples_per_class=max_samples_per_class)
+    full_train_dataset = OCTDataset(data_dir, split='train', classes=classes, use_clahe=use_clahe,
+                                    transform=train_transform, max_samples_per_class=max_samples_per_class)
     
-    val_dir = os.path.join(data_dir, 'val')
-    if os.path.exists(val_dir):
-        val_dataset = OCTDataset(data_dir, split='val', classes=classes, use_clahe=use_clahe,
-                                transform=val_transform, max_samples_per_class=max_samples_per_class)
-    else:
-        val_dataset = OCTDataset(data_dir, split='train', classes=classes, use_clahe=use_clahe,
-                                transform=val_transform, max_samples_per_class=100)
-        
     test_dataset = OCTDataset(data_dir, split='test', classes=classes, use_clahe=use_clahe,
                              transform=val_transform, max_samples_per_class=max_samples_per_class)
+    
+    raw_val_dir = os.path.join(data_dir, 'val')
+    raw_val_count = 0
+    if os.path.exists(raw_val_dir):
+        for cls in classes:
+            cpath = os.path.join(raw_val_dir, cls)
+            if os.path.exists(cpath):
+                raw_val_count += len([f for f in os.listdir(cpath) if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
+                
+    # If official val directory has < 500 images (like Kermany's 32 images), do a proper 10% split of train
+    if raw_val_count < 500:
+        val_size = int(len(full_train_dataset) * val_ratio)
+        train_size = len(full_train_dataset) - val_size
+        generator = torch.Generator().manual_seed(seed)
+        train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size], generator=generator)
+        # Apply validation transform to val split
+        val_dataset.dataset.transform = val_transform
+    else:
+        train_dataset = full_train_dataset
+        val_dataset = OCTDataset(data_dir, split='val', classes=classes, use_clahe=use_clahe,
+                                transform=val_transform, max_samples_per_class=max_samples_per_class)
+
+    print(f"\n📊 DataLoader Setup Summary:")
+    print(f"   Train samples: {len(train_dataset):,}")
+    print(f"   Val samples:   {len(val_dataset):,}")
+    print(f"   Test samples:  {len(test_dataset):,}\n")
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
                               num_workers=num_workers, pin_memory=True)
